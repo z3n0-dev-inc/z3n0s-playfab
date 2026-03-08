@@ -1,18 +1,11 @@
-// playfab.js — PlayFab Server/Admin API helper for ZTD Discord bot
-// Uses X-SecretKey (server-side secret) — never expose this in client code.
+// playfab.js — PlayFab Server/Admin API helper
+require('dotenv').config();
 const fetch = require('node-fetch');
 
 const TITLE_ID   = process.env.PLAYFAB_TITLE_ID;
 const SECRET_KEY = process.env.PLAYFAB_SECRET_KEY;
+const BASE       = `https://${TITLE_ID}.playfabapi.com`;
 
-if (!TITLE_ID || !SECRET_KEY) {
-  console.error('[PlayFab] Missing PLAYFAB_TITLE_ID or PLAYFAB_SECRET_KEY in .env');
-  process.exit(1);
-}
-
-const BASE = `https://${TITLE_ID}.playfabapi.com`;
-
-// ── Core request helper ───────────────────────────────────────────
 async function pfServer(endpoint, body) {
   try {
     const res  = await fetch(BASE + endpoint, {
@@ -21,17 +14,15 @@ async function pfServer(endpoint, body) {
       body:    JSON.stringify(body),
     });
     const json = await res.json();
-    if (json.code !== 200) {
-      console.error(`[PlayFab] ${endpoint} → ${json.errorMessage || json.code}`);
-    }
+    if (json.code !== 200) console.error(`[PlayFab] ${endpoint} → ${json.errorMessage || json.code}`);
     return { ok: json.code === 200, data: json.data, msg: json.errorMessage || '' };
   } catch (e) {
-    console.error(`[PlayFab] ${endpoint} fetch failed:`, e.message);
+    console.error(`[PlayFab] ${endpoint} failed:`, e.message);
     return { ok: false, data: null, msg: e.message };
   }
 }
 
-// ── Resolve username OR 16-char hex PlayFab ID → PlayFab ID ──────
+// Resolve username OR 16-char PlayFab ID
 async function resolveId(nameOrId) {
   if (!nameOrId) return { ok: false, msg: 'No player specified' };
   const v = nameOrId.trim();
@@ -39,38 +30,42 @@ async function resolveId(nameOrId) {
   const r = await pfServer('/Server/GetUserAccountInfo', { Username: v });
   if (r.ok && r.data?.UserInfo?.PlayFabId)
     return { ok: true, playFabId: r.data.UserInfo.PlayFabId };
-  return { ok: false, msg: `Player "${v}" not found. Try their PlayFab ID instead.` };
+  return { ok: false, msg: `Player "${v}" not found. Username is case-sensitive.` };
 }
 
-// ── Full player profile ───────────────────────────────────────────
+// Look up by username (for /link command)
+async function getAccountByUsername(username) {
+  const r = await pfServer('/Server/GetUserAccountInfo', { Username: username.trim() });
+  if (!r.ok) return { ok: false, msg: r.msg || 'Username not found in ZTD' };
+  const info = r.data?.UserInfo;
+  if (!info?.PlayFabId) return { ok: false, msg: 'Username not found' };
+  return {
+    ok:          true,
+    playFabId:   info.PlayFabId,
+    displayName: info.TitleInfo?.DisplayName || info.Username || username,
+    username:    info.Username || username,
+  };
+}
+
+// Full player profile for /playerinfo
 async function getPlayerProfile(pfId) {
   const [profileRes, statsRes, banRes, invRes, dataRes] = await Promise.all([
     pfServer('/Server/GetUserAccountInfo',  { PlayFabId: pfId }),
     pfServer('/Server/GetPlayerStatistics', { PlayFabId: pfId }),
     pfServer('/Server/GetUserBans',         { PlayFabId: pfId }),
     pfServer('/Server/GetUserInventory',    { PlayFabId: pfId }),
-    pfServer('/Server/GetUserData', {
-      PlayFabId: pfId,
-      Keys: ['Warnings', 'OwnedTowers', 'Coins', 'BestWave', 'TotalKills', 'AccountXP', 'IsOwner', 'IsMod'],
-    }),
+    pfServer('/Server/GetUserData', { PlayFabId: pfId, Keys: ['Warnings','OwnedTowers','Coins','BestWave','TotalKills','AccountXP','IsOwner','IsMod'] }),
   ]);
 
-  const profile  = profileRes.data?.UserInfo || {};
-  const stats    = {};
+  const profile    = profileRes.data?.UserInfo || {};
+  const stats      = {};
   (statsRes.data?.Statistics || []).forEach(s => { stats[s.StatisticName] = s.Value; });
-
   const now        = Date.now();
   const allBans    = banRes.data?.BanData || [];
-  const activeBans = allBans.filter(b =>
-    b.Active && (!b.Expires || new Date(b.Expires).getTime() > now)
-  );
-
-  const inventory = (invRes.data?.Inventory || []).map(i => i.ItemId);
-  const ud        = dataRes.data?.Data || {};
-
-  const safeJson = (val, fallback) => {
-    try { return JSON.parse(val || JSON.stringify(fallback)); } catch { return fallback; }
-  };
+  const activeBans = allBans.filter(b => b.Active && (!b.Expires || new Date(b.Expires).getTime() > now));
+  const inventory  = (invRes.data?.Inventory || []).map(i => i.ItemId);
+  const ud         = dataRes.data?.Data || {};
+  const safeJson   = (val, fb) => { try { return JSON.parse(val || JSON.stringify(fb)); } catch { return fb; } };
 
   return {
     playFabId:   pfId,
@@ -93,38 +88,14 @@ async function getPlayerProfile(pfId) {
   };
 }
 
-// ── Look up account by username (for /link) ───────────────────────
-async function getAccountByUsername(username) {
-  const r = await pfServer('/Server/GetUserAccountInfo', { Username: username.trim() });
-  if (!r.ok) return { ok: false, msg: r.msg || 'Username not found in ZTD' };
-  const info = r.data?.UserInfo;
-  if (!info?.PlayFabId) return { ok: false, msg: 'Username not found' };
-  return {
-    ok:          true,
-    playFabId:   info.PlayFabId,
-    displayName: info.TitleInfo?.DisplayName || info.Username || username,
-    username:    info.Username || username,
-  };
-}
-
-// ── Discord ↔ PlayFab link storage ───────────────────────────────
-// Stored in PlayFab Title Internal Data under key "DiscordLinks".
-// Internal data is only readable server-side (not exposed to clients).
-// Read:  /Server/GetTitleInternalData  → response.data.Data["DiscordLinks"].Value
-// Write: /Admin/SetTitleInternalData   → body { TitleData: { "DiscordLinks": "..." } }
-
+// Discord ↔ PlayFab link storage (stored in PlayFab Title Internal Data)
 async function _readLinks() {
   const r = await pfServer('/Server/GetTitleInternalData', { Keys: ['DiscordLinks'] });
-  // GetTitleInternalData returns { Data: { "DiscordLinks": { "Value": "..." } } }
-  const raw = r.data?.Data?.DiscordLinks?.Value || '{}';
-  try { return JSON.parse(raw); } catch { return {}; }
+  try { return JSON.parse(r.data?.Data?.DiscordLinks?.Value || '{}'); } catch { return {}; }
 }
 
 async function _writeLinks(map) {
-  // Admin SetTitleInternalData body: { TitleData: { key: value } }
-  const r = await pfServer('/Admin/SetTitleInternalData', {
-    TitleData: { DiscordLinks: JSON.stringify(map) },
-  });
+  const r = await pfServer('/Admin/SetTitleInternalData', { TitleData: { DiscordLinks: JSON.stringify(map) } });
   return r.ok;
 }
 
@@ -143,12 +114,4 @@ async function getAllLinks() {
   return _readLinks();
 }
 
-module.exports = {
-  pfServer,
-  resolveId,
-  getPlayerProfile,
-  getAccountByUsername,
-  linkAccount,
-  getLinkedAccount,
-  getAllLinks,
-};
+module.exports = { pfServer, resolveId, getAccountByUsername, getPlayerProfile, linkAccount, getLinkedAccount, getAllLinks };
