@@ -6,11 +6,9 @@ const embeds = require('./embeds');
 const STAFF_CHANNEL = process.env.DISCORD_STAFF_CHANNEL;
 const MOD_ROLE_ID   = process.env.MOD_ROLE_ID;
 
-// Startup checks
 if (!process.env.DISCORD_BOT_TOKEN)                           { console.error('[Bot] DISCORD_BOT_TOKEN not set'); process.exit(1); }
 if (!process.env.PLAYFAB_TITLE_ID || !process.env.PLAYFAB_SECRET_KEY) { console.error('[Bot] PlayFab keys not set'); process.exit(1); }
 
-// Profile cache — 60 seconds
 const _cache  = new Map();
 const CACHE_S = 60_000;
 
@@ -34,7 +32,7 @@ client.once(Events.ClientReady, async () => {
   console.log(`[Bot] Staff channel: ${STAFF_CHANNEL || 'not set'}`);
   console.log(`[Bot] Mod role:      ${MOD_ROLE_ID   || 'not set'}`);
   const test = await PF.pfServer('/Server/GetTitleData', { Keys: ['_test'] });
-  console.log(`[Bot] PlayFab:       ${test.ok ? '✅ connected' : '⚠️  ' + test.msg}`);
+  console.log(`[Bot] PlayFab:       ${test.ok ? 'connected' : 'ERROR: ' + test.msg}`);
   client.user.setActivity('Zombie Tower Defence', { type: 0 });
   console.log('[Bot] Ready.\n');
 });
@@ -42,27 +40,114 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
-  // ── /link ─────────────────────────────────────────────────────
+  // /link
   if (interaction.commandName === 'link') {
     await interaction.deferReply({ ephemeral: true });
-    const username = interaction.options.getString('username');
+    const username = interaction.options.getString('username').trim();
 
-    const result = await PF.getAccountByUsername(username);
+    let result = await PF.getAccountByUsername(username);
+
+    // Fallback: accept raw PlayFab ID
+    if (!result.ok && /^[0-9A-Fa-f]{12,16}$/i.test(username)) {
+      result = { ok: true, playFabId: username, displayName: username };
+    }
+
     if (!result.ok) {
       return interaction.editReply({ embeds: [embeds.err(
-        `Couldn't find **${username}** in ZTD.\nMake sure you type your exact in-game username — it's case-sensitive.`
+        `Couldn't find **${username}** in ZTD.\n\nMake sure you type your **exact in-game username** (case-sensitive).\n\nOr paste your **PlayFab ID** directly — find it on your in-game Profile tab.`
       )] });
     }
 
     const saved = await PF.linkAccount(interaction.user.id, result.playFabId, result.displayName);
     if (!saved) {
-      return interaction.editReply({ embeds: [embeds.err('Failed to save the link. Please try again in a moment.')] });
+      return interaction.editReply({ embeds: [embeds.err('Failed to save the link. Please try again.')] });
     }
 
     return interaction.editReply({ embeds: [embeds.linkEmbed(result.displayName, result.playFabId)] });
   }
 
-  // ── /playerinfo ───────────────────────────────────────────────
+  // /grant
+  if (interaction.commandName === 'grant') {
+    await interaction.deferReply({ ephemeral: true });
+
+    if (!isMod(interaction.member)) {
+      return interaction.editReply({ embeds: [embeds.err('You need the **Moderator** role to use this command.')] });
+    }
+
+    const playerInput = interaction.options.getString('player').trim();
+    const itemId      = interaction.options.getString('item');
+
+    const resolved = await PF.resolveId(playerInput);
+    if (!resolved.ok) {
+      return interaction.editReply({ embeds: [embeds.err(`Player not found: **${playerInput}**\nCheck the username/ID and try again.`)] });
+    }
+
+    const result = await PF.grantItem(resolved.playFabId, itemId);
+    if (!result.ok) {
+      return interaction.editReply({ embeds: [embeds.err(`Failed to grant **${itemId}**: ${result.msg}`)] });
+    }
+
+    const embed = {
+      color: 0x57f287,
+      title: 'Item Granted',
+      fields: [
+        { name: 'Player ID',  value: '`' + resolved.playFabId + '`', inline: true },
+        { name: 'Item',       value: '`' + itemId + '`',             inline: true },
+        { name: 'Granted by', value: '<@' + interaction.user.id + '>', inline: true },
+      ],
+      footer: { text: 'Player must re-login to see the item in-game' },
+      timestamp: new Date().toISOString(),
+    };
+
+    if (STAFF_CHANNEL) {
+      const ch = client.channels.cache.get(STAFF_CHANNEL);
+      if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+    }
+
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  // /revoke
+  if (interaction.commandName === 'revoke') {
+    await interaction.deferReply({ ephemeral: true });
+
+    if (!isMod(interaction.member)) {
+      return interaction.editReply({ embeds: [embeds.err('You need the **Moderator** role to use this command.')] });
+    }
+
+    const playerInput = interaction.options.getString('player').trim();
+    const itemId      = interaction.options.getString('item');
+
+    const resolved = await PF.resolveId(playerInput);
+    if (!resolved.ok) {
+      return interaction.editReply({ embeds: [embeds.err(`Player not found: **${playerInput}**`)] });
+    }
+
+    const result = await PF.revokeItem(resolved.playFabId, itemId);
+    if (!result.ok) {
+      return interaction.editReply({ embeds: [embeds.err(`Failed to revoke **${itemId}**: ${result.msg}`)] });
+    }
+
+    const embed = {
+      color: 0xed4245,
+      title: 'Item Revoked',
+      fields: [
+        { name: 'Player ID',  value: '`' + resolved.playFabId + '`', inline: true },
+        { name: 'Item',       value: '`' + itemId + '`',             inline: true },
+        { name: 'Revoked by', value: '<@' + interaction.user.id + '>', inline: true },
+      ],
+      timestamp: new Date().toISOString(),
+    };
+
+    if (STAFF_CHANNEL) {
+      const ch = client.channels.cache.get(STAFF_CHANNEL);
+      if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+    }
+
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  // /playerinfo
   if (interaction.commandName === 'playerinfo') {
     await interaction.deferReply({ ephemeral: true });
 
@@ -71,12 +156,10 @@ client.on(Events.InteractionCreate, async interaction => {
     const targetId       = interaction.options.getString('playfab_id');
     const modLookup      = targetUser || targetUsername || targetId;
 
-    // Non-mod trying to look up someone else
     if (modLookup && !isMod(interaction.member)) {
       return interaction.editReply({ embeds: [embeds.err("You don't have permission to look up other players.")] });
     }
 
-    // Self-lookup
     if (!modLookup) {
       const linked = await PF.getLinkedAccount(interaction.user.id);
       if (!linked) {
@@ -92,7 +175,6 @@ client.on(Events.InteractionCreate, async interaction => {
       }
     }
 
-    // Mod lookup
     let playFabId = null;
 
     if (targetUser) {
@@ -114,7 +196,6 @@ client.on(Events.InteractionCreate, async interaction => {
       const profile = await getCached(playFabId);
       const embed   = embeds.reportEmbed(profile, interaction.user.tag);
 
-      // Post to staff channel
       if (STAFF_CHANNEL) {
         const ch = client.channels.cache.get(STAFF_CHANNEL);
         if (ch) ch.send({ embeds: [embed] }).catch(e => console.error('[Bot] Staff channel error:', e.message));

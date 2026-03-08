@@ -114,4 +114,33 @@ async function getAllLinks() {
   return _readLinks();
 }
 
-module.exports = { pfServer, resolveId, getAccountByUsername, getPlayerProfile, linkAccount, getLinkedAccount, getAllLinks };
+module.exports = { pfServer, resolveId, getAccountByUsername, getPlayerProfile, linkAccount, getLinkedAccount, getAllLinks, grantItem, revokeItem };
+
+// Grant a catalog item to a player
+async function grantItem(playFabId, itemId) {
+  const r = await pfServer('/Server/GrantItemsToUser', {
+    PlayFabId:      playFabId,
+    ItemIds:        [itemId],
+    CatalogVersion: 'ZTD_Cosmetics_v1',
+  });
+  if (r.ok) return { ok: true };
+  return { ok: false, msg: r.msg || 'Grant failed' };
+}
+
+// Revoke all instances of an item from a player
+async function revokeItem(playFabId, itemId) {
+  const invRes = await pfServer('/Server/GetUserInventory', { PlayFabId: playFabId });
+  if (!invRes.ok) return { ok: false, msg: 'Could not fetch inventory' };
+
+  const instances = (invRes.data?.Inventory || [])
+    .filter(i => i.ItemId === itemId)
+    .map(i => i.ItemInstanceId);
+
+  if (instances.length === 0) return { ok: false, msg: 'Player does not have that item' };
+
+  for (const instanceId of instances) {
+    await pfServer('/Admin/RevokeInventoryItem', { PlayFabId: playFabId, ItemInstanceId: instanceId });
+  }
+  return { ok: true };
+}
+
