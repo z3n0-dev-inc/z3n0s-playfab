@@ -1,10 +1,13 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Events } = require('discord.js');
+const http   = require('http');
 const PF     = require('./playfab');
 const embeds = require('./embeds');
 
-const STAFF_CHANNEL = process.env.DISCORD_STAFF_CHANNEL;
-const MOD_ROLE_ID   = process.env.MOD_ROLE_ID;
+const STAFF_CHANNEL  = process.env.DISCORD_STAFF_CHANNEL;
+const MOD_ROLE_ID    = process.env.MOD_ROLE_ID;
+const BOT_HTTP_PORT  = process.env.BOT_HTTP_PORT || 3001;
+const BOT_SECRET     = process.env.BOT_SECRET    || 'ztd-internal';
 
 if (!process.env.DISCORD_BOT_TOKEN)                           { console.error('[Bot] DISCORD_BOT_TOKEN not set'); process.exit(1); }
 if (!process.env.PLAYFAB_TITLE_ID || !process.env.PLAYFAB_SECRET_KEY) { console.error('[Bot] PlayFab keys not set'); process.exit(1); }
@@ -54,7 +57,11 @@ client.on(Events.InteractionCreate, async interaction => {
 
     if (!result.ok) {
       return interaction.editReply({ embeds: [embeds.err(
-        `Couldn't find **${username}** in ZTD.\n\nMake sure you type your **exact in-game username** (case-sensitive).\n\nOr paste your **PlayFab ID** directly — find it on your in-game Profile tab.`
+        `Couldn't find **${username}** in ZTD.
+
+**Try these:**
+• Your exact PlayFab **username** (case-sensitive)
+• Your **PlayFab ID** (16-char code — use 📋 Copy ID in the in-game panel)`
       )] });
     }
 
@@ -210,5 +217,47 @@ client.on(Events.InteractionCreate, async interaction => {
 
 client.on('error', e => console.error('[Discord error]', e));
 process.on('unhandledRejection', e => console.error('[Unhandled]', e));
+
+// ── Internal HTTP server (receives staff report calls from game server) ──
+const httpServer = http.createServer(async (req, res) => {
+  if (req.method !== 'POST' || req.url !== '/internal/staffReport') {
+    res.writeHead(404); res.end(); return;
+  }
+
+  // Auth check
+  const auth = req.headers['x-bot-secret'];
+  if (auth !== BOT_SECRET) {
+    res.writeHead(401); res.end(JSON.stringify({ ok: false, msg: 'Unauthorized' })); return;
+  }
+
+  let body = '';
+  req.on('data', chunk => body += chunk);
+  req.on('end', async () => {
+    try {
+      const { report, staffName } = JSON.parse(body);
+      if (!report || !STAFF_CHANNEL) {
+        res.writeHead(400); res.end(JSON.stringify({ ok: false, msg: 'Missing report or channel' })); return;
+      }
+
+      const ch = client.channels.cache.get(STAFF_CHANNEL);
+      if (!ch) {
+        res.writeHead(500); res.end(JSON.stringify({ ok: false, msg: 'Staff channel not found' })); return;
+      }
+
+      const embed = embeds.reportEmbed(report, staffName || 'in-game mod');
+      await ch.send({ embeds: [embed] });
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (e) {
+      console.error('[HTTP] staffReport error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ ok: false, msg: e.message }));
+    }
+  });
+});
+
+httpServer.listen(BOT_HTTP_PORT, () => {
+  console.log(`[Bot] Internal HTTP server listening on port ${BOT_HTTP_PORT}`);
+});
 
 client.login(process.env.DISCORD_BOT_TOKEN);

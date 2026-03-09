@@ -33,18 +33,37 @@ async function resolveId(nameOrId) {
   return { ok: false, msg: `Player "${v}" not found. Username is case-sensitive.` };
 }
 
-// Look up by username (for /link command)
+// Look up by username (for /link command) — also tries display name fallback
 async function getAccountByUsername(username) {
-  const r = await pfServer('/Server/GetUserAccountInfo', { Username: username.trim() });
-  if (!r.ok) return { ok: false, msg: r.msg || 'Username not found in ZTD' };
-  const info = r.data?.UserInfo;
-  if (!info?.PlayFabId) return { ok: false, msg: 'Username not found' };
-  return {
-    ok:          true,
-    playFabId:   info.PlayFabId,
-    displayName: info.TitleInfo?.DisplayName || info.Username || username,
-    username:    info.Username || username,
-  };
+  const trimmed = username.trim();
+
+  // First try exact username
+  const r = await pfServer('/Server/GetUserAccountInfo', { Username: trimmed });
+  if (r.ok && r.data?.UserInfo?.PlayFabId) {
+    const info = r.data.UserInfo;
+    return {
+      ok: true,
+      playFabId: info.PlayFabId,
+      displayName: info.TitleInfo?.DisplayName || info.Username || trimmed,
+      username: info.Username || trimmed,
+    };
+  }
+
+  // Fallback: try as PlayFab ID directly
+  if (/^[0-9A-Fa-f]{12,16}$/i.test(trimmed)) {
+    const r2 = await pfServer('/Server/GetUserAccountInfo', { PlayFabId: trimmed });
+    if (r2.ok && r2.data?.UserInfo?.PlayFabId) {
+      const info = r2.data.UserInfo;
+      return {
+        ok: true,
+        playFabId: info.PlayFabId,
+        displayName: info.TitleInfo?.DisplayName || info.Username || trimmed,
+        username: info.Username || trimmed,
+      };
+    }
+  }
+
+  return { ok: false, msg: `Couldn't find **${trimmed}** — try your exact PlayFab username (case-sensitive) or paste your PlayFab ID directly.` };
 }
 
 // Full player profile for /playerinfo
